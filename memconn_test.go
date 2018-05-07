@@ -8,57 +8,12 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/akutz/memconn"
 )
-
-// TestMemuRace is for verifying there is no race condition when
-// calling Dial and Listen concurrently for the same address. The
-// Provider.Dial function did not used to initialize the Provider.cnxns
-// map since the function only queries it, and querying a nil map is
-// allowed. However, Go detected a race condition when the field was
-// both assigned and queried at the same time.
-//
-// Many thanks to @vburenin for spotting this!
-//
-//         $ go test -race -run TestMemuRace
-func TestMemuRace(t *testing.T) {
-	for i := 0; i < 1000; i++ {
-		p := &memconn.Provider{}
-		addr := strconv.Itoa(i)
-		go func(p *memconn.Provider, addr string) {
-			if c, err := p.Listen("memu", addr); err == nil {
-				go c.Accept()
-			}
-		}(p, addr)
-		go func(p *memconn.Provider, addr string) {
-			if c, err := p.Dial("memu", addr); err == nil {
-				c.Close()
-			}
-		}(p, addr)
-	}
-}
-
-func TestMembRace(t *testing.T) {
-	for i := 0; i < 1000; i++ {
-		p := &memconn.Provider{}
-		addr := strconv.Itoa(i)
-		go func(p *memconn.Provider, addr string) {
-			if c, err := p.Listen("memb", addr); err == nil {
-				go c.Accept()
-			}
-		}(p, addr)
-		go func(p *memconn.Provider, addr string) {
-			if c, err := p.Dial("memb", addr); err == nil {
-				c.Close()
-			}
-		}(p, addr)
-	}
-}
 
 // TestMemuNoDeadline validates that the memu connection properly implements
 // the net.Conn interface's deadline semantics.
