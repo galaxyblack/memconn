@@ -2,9 +2,7 @@ package memconn
 
 import (
 	"bytes"
-	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -20,45 +18,45 @@ type Conn struct {
 	// buf contains information about the connection's buffer state if
 	// the connection is buffered. Otherwise this field is nil.
 	buf *bufConn
-
-	isRemote bool
 }
 
 type bufConn struct {
-
-	// Please see the SetBufferSize function for more information.
-	max      int
-	growOnce sync.Once
-
 	// Please see the SetCloseTimeout function for more information.
-	closeTimeout time.Duration
+	timeout time.Duration
 
 	// errs is the error channel returned by the Errs() function and
 	// used to report erros that occur as a result of buffered write
-	// operations. If the pipe does not use buffered writes then this
-	// field will always be nil.
+	// operations.
 	errs chan error
 
-	// data is a circular buffer used to provide buffered writes
+	// tx is used for buffering writes.
+	tx bufTx
+}
+
+type bufTx struct {
+	// Once is used by the writeAsync function to:
+	//
+	//   * Grow the buffer to satisfy "size" bytes
+	//   * Start the goroutine in which the read loop is executed
+	sync.Once
+
+	// lock is a channel used to disallow concurrent, buffered writes.
+	lock chan struct{}
+
+	// Please see the SetWriteBuffer functions for more information.
+	size int
+
+	// data is used to buffer the Writes.
 	data bytes.Buffer
 
-	// configMu is used to synchronize access to buffered connection
-	// settings.
-	configMu sync.RWMutex
+	// rdRx is a channel that receives a signal when the buffer has
+	// data to be read.
+	rdRx chan struct{}
 
-	// sigPrev is a signal that buffered write goroutines use to
-	// block until the previous write has completed.
-	sigPrev chan struct{}
-
-	// wait is used to track the enqueue activity of buffered Writes.
-	// wait is used by the Close function to block until all enqueue
-	// attempts have completed.
-	wait sync.WaitGroup
-
-	cond sync.Cond
-
-	done chan struct{}
-	lock chan struct{}
+	// wrRx is a channel that receives a signal when the buffer has
+	// free space. This channel is buffered and can accept a single
+	// signal before the channel begins to block.
+	wrRx chan struct{}
 }
 
 func makeNewConns(network string, laddr, raddr Addr) (*Conn, *Conn) {
@@ -103,35 +101,32 @@ func makeNewConns(network string, laddr, raddr Addr) (*Conn, *Conn) {
 			readDeadline:  makePipeDeadline(),
 			writeDeadline: makePipeDeadline(),
 		},
-		laddr:    raddr,
-		raddr:    laddr,
-		isRemote: true,
+		laddr: raddr,
+		raddr: laddr,
 	}
 
 	if laddr.Buffered() {
 		local.buf = &bufConn{
-			max:          64,
-			errs:         make(chan error),
-			closeTimeout: 0 * time.Second,
-			sigPrev:      make(chan struct{}),
-			done:         make(chan struct{}),
-			lock:         make(chan struct{}, 1),
+			errs:    make(chan error),
+			timeout: 0 * time.Second,
+			tx: bufTx{
+				lock: make(chan struct{}, 1),
+				rdRx: make(chan struct{}),
+				wrRx: make(chan struct{}, 1),
+			},
 		}
-		local.buf.cond.L = &sync.Mutex{}
-		close(local.buf.sigPrev)
 	}
 
 	if raddr.Buffered() {
 		remote.buf = &bufConn{
-			max:          64,
-			errs:         make(chan error),
-			closeTimeout: 3 * time.Second,
-			sigPrev:      make(chan struct{}),
-			done:         make(chan struct{}),
-			lock:         make(chan struct{}, 1),
+			errs:    make(chan error),
+			timeout: 3 * time.Second,
+			tx: bufTx{
+				lock: make(chan struct{}, 1),
+				rdRx: make(chan struct{}),
+				wrRx: make(chan struct{}, 1),
+			},
 		}
-		remote.buf.cond.L = &sync.Mutex{}
-		close(remote.buf.sigPrev)
 	}
 
 	return local, remote
@@ -149,72 +144,37 @@ func (c *Conn) RemoteBuffered() bool {
 	return c.raddr.Buffered()
 }
 
-// BufferSize gets the number of bytes allowed to be queued for
-// asynchrnous Write operations.
+// SetWriteBuffer sets the number of bytes allowed to be queued for
+// buffered Writes. Once the buffer is full, Write IO is blocked until
+// the buffer has free space.
 //
-// Please note that this function will always return zero for unbuffered
-// connections.
+// The default buffer size is zero, which means no maximum is defined.
 //
-// Please see the function SetBufferSize for more information.
-func (c *Conn) BufferSize() int {
-	if c.laddr.Buffered() {
-		c.buf.configMu.RLock()
-		defer c.buf.configMu.RUnlock()
-		return c.buf.max
-	}
-	return 0
-}
-
-// SetBufferSize sets the number of bytes allowed to be queued for
-// asynchronous Write operations. Once the amount of data pending a Write
-// operation exceeds the specified size, subsequent Writes will
-// block until the queued data no longer exceeds the allowed ceiling.
-//
-// A value of zero means no maximum is defined.
-//
-// If a Write operation's payload length exceeds the buffer size
-// (except for zero) then the Write operation is handled synchronously.
+// Setting this value has no effect after the first Write to the
+// connection.
 //
 // Please note that setting the buffer size has no effect on unbuffered
 // connections.
-func (c *Conn) SetBufferSize(i int) {
-	if c.laddr.Buffered() {
-		c.buf.configMu.Lock()
-		defer c.buf.configMu.Unlock()
-		c.buf.max = i
+func (c *Conn) SetWriteBuffer(bytes int) {
+	if c.buf != nil {
+		c.buf.tx.size = bytes
 	}
-}
-
-// CloseTimeout gets the time.Duration value used when closing buffered
-// connections.
-//
-// Please note that this function will always return zero for
-// unbuffered connections.
-//
-// Please see the function SetCloseTimeout for more information.
-func (c *Conn) CloseTimeout() time.Duration {
-	if c.laddr.Buffered() {
-		c.buf.configMu.RLock()
-		defer c.buf.configMu.RUnlock()
-		return c.buf.closeTimeout
-	}
-	return 0
 }
 
 // SetCloseTimeout sets a time.Duration value used by the Close function
 // to determine the amount of time to wait for pending, buffered Writes
 // to complete before closing the connection.
 //
-// The default timeout value is 10 seconds. A zero value does not
-// mean there is no timeout, rather it means the timeout is immediate.
+// The default timeout value is 0 seconds for the local side of a
+// connection and 3 seconds for the remote side of a connection.
+//
+// A zero value means the connection is closed immediately.
 //
 // Please note that setting this value has no effect on unbuffered
 // connections.
-func (c *Conn) SetCloseTimeout(d time.Duration) {
-	if c.laddr.Buffered() {
-		c.buf.configMu.Lock()
-		defer c.buf.configMu.Unlock()
-		c.buf.closeTimeout = d
+func (c *Conn) SetCloseTimeout(duration time.Duration) {
+	if c.buf != nil {
+		c.buf.timeout = duration
 	}
 }
 
@@ -231,39 +191,25 @@ func (c *Conn) RemoteAddr() net.Addr {
 // Close implements the net.Conn Close method.
 func (c *Conn) Close() error {
 	c.pipe.once.Do(func() {
-
 		// Buffered connections will attempt to wait until all
 		// pending Writes are completed or until the specified
 		// timeout value has elapsed.
-		if c.laddr.Buffered() {
+		if c.buf != nil {
+			// Locking the buffer ensures no more buffered Writes
+			// are enqueued.
+			c.buf.tx.lock <- struct{}{}
 
-			// Set up a channel that is closed when the specified
-			// timer elapses.
-			timeoutDone := make(chan struct{})
-			if t := c.CloseTimeout(); t == 0 {
-				close(timeoutDone)
-			} else {
-				time.AfterFunc(t, func() { close(timeoutDone) })
-			}
-
-			// Set up a channel that is closed when all enqueue
-			// operations have completed.
-			go func() {
-				c.buf.lock <- struct{}{}
-				c.buf.wait.Wait()
-				close(c.buf.done)
-			}()
-
-			// Wait to close the connection.
+			// Block until the read loop indicates it has drained
+			// the buffer or until the specified timeout has elapsed.
 			select {
-			case <-c.buf.done:
-			case <-timeoutDone:
+			case <-c.buf.tx.wrRx:
+			case <-time.After(c.buf.timeout):
 			}
 		}
 
 		close(c.pipe.localDone)
 	})
-	return nil
+	return c.pipe.Close()
 }
 
 // Errs returns a channel that receives errors that may occur as the
@@ -292,7 +238,7 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 			Op:     "setReadDeadline",
 			Addr:   c.laddr,
 			Source: c.laddr,
-			Net:    c.laddr.Network(),
+			Net:    c.laddr.network,
 			Err:    err,
 		}
 	}
@@ -311,7 +257,7 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 			Op:     "setWriteDeadline",
 			Addr:   c.laddr,
 			Source: c.laddr,
-			Net:    c.laddr.Network(),
+			Net:    c.laddr.network,
 			Err:    err,
 		}
 	}
@@ -331,7 +277,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 			Op:     "read",
 			Addr:   c.raddr,
 			Source: c.laddr,
-			Net:    c.raddr.Network(),
+			Net:    c.raddr.network,
 			Err:    err,
 		}
 	}
@@ -339,15 +285,15 @@ func (c *Conn) Read(b []byte) (int, error) {
 }
 
 // Write implements the net.Conn Write method.
-func (c *Conn) Write(b []byte) (int, error) {
-	if c.laddr.Buffered() {
-		return c.writeAsync(b)
+func (c *Conn) Write(p []byte) (int, error) {
+	if c.buf != nil {
+		return c.writeAsync(p)
 	}
-	return c.writeSync(b)
+	return c.writeSync(p)
 }
 
-func (c *Conn) writeSync(b []byte) (int, error) {
-	n, err := c.pipe.Write(b)
+func (c *Conn) writeSync(p []byte) (int, error) {
+	n, err := c.pipe.Write(p)
 	if err != nil {
 		if e, ok := err.(*net.OpError); ok {
 			e.Addr = c.raddr
@@ -358,7 +304,7 @@ func (c *Conn) writeSync(b []byte) (int, error) {
 			Op:     "write",
 			Addr:   c.raddr,
 			Source: c.laddr,
-			Net:    c.raddr.Network(),
+			Net:    c.raddr.network,
 			Err:    err,
 		}
 	}
@@ -369,170 +315,144 @@ func (c *Conn) writeSync(b []byte) (int, error) {
 // behavior means the Write operation is not blocking, but also means
 // that when Write operations fail the associated error is not returned
 // from this function.
-func (c *Conn) writeAsync(b []byte) (int, error) {
-	// Block until either the buffer's done channel is closed or until
-	// it's okay to write.
+func (c *Conn) writeAsync(p []byte) (int, error) {
+	// Block until exclusive access to the buffer is granted or until
+	// the local side of the connection has been closed.
 	select {
-	case <-c.buf.done:
-		return 0, io.ErrClosedPipe
-	case c.buf.lock <- struct{}{}:
-		defer func() { <-c.buf.lock }()
-		// Proceed
+	case c.buf.tx.lock <- struct{}{}:
+		defer func() { <-c.buf.tx.lock }()
+	case <-c.localDone:
+		return 0, &net.OpError{
+			Op:     "write",
+			Addr:   c.raddr,
+			Source: c.laddr,
+			Net:    c.raddr.network,
+			Err:    io.ErrClosedPipe,
+		}
 	}
 
-	c.buf.growOnce.Do(func() {
-		c.buf.data.Grow(c.buf.max)
+	// On the first Write do the following exactly once:
+	//   * Grow the buffer to satisify the specified maximum.
+	//   * Start the loop that reads from the buffer and writes to
+	//     the underlying pipe.
+	c.buf.tx.Once.Do(func() {
+		c.buf.tx.data.Grow(c.buf.tx.size)
+		go c.readBufferWriteToPipeLoop()
 	})
 
-	// Store the payload's size since the payload may be altered.
-	lb := len(b)
-
-	// nb is the total number of bytes that have been buffered
-	var nb int
+	var buffered int
 
 	// Write the payload to the buffer until the number of bytes that
 	// have been buffered equals the size of the original payload.
-	for nb < lb {
+	for len(p) > 0 {
 
-		// Buffer as much data as possible.
-		nbw, err := c.writeBuffer(b)
-		nb = nb + nbw
-
-		if !c.isRemote {
-			log.Printf("%05d %05d %05d", lb, nb, len(b))
+		// Block until the buffer has free space or until the remote
+		// side of the connection has been closed.
+		select {
+		case <-c.buf.tx.rdRx:
+		case <-c.remoteDone:
+			return buffered, &net.OpError{
+				Op:     "write",
+				Addr:   c.raddr,
+				Source: c.laddr,
+				Net:    c.raddr.network,
+				Err:    io.ErrClosedPipe,
+			}
 		}
 
+		// b2b is the number of bytes-to-buffer
+		var b2b int
+
+		// If the buffer has no set maximum or if its capacity is
+		// larger than len(b), buffer all of b at once. Otherwise
+		// fill the buffer to its capacity.
+		if c.buf.tx.size == 0 || c.buf.tx.data.Cap() > len(p) {
+			b2b = len(p)
+		} else {
+			b2b = c.buf.tx.data.Cap()
+		}
+
+		// Buffer the data.
+		n, err := c.buf.tx.data.Write(p[:b2b])
+		buffered = buffered + n
 		if err != nil {
-			return nb, err
+			return buffered, &net.OpError{
+				Op:     "write",
+				Addr:   c.raddr,
+				Source: c.laddr,
+				Net:    c.raddr.network,
+				Err:    err,
+			}
 		}
 
 		// Remove the number of bytes buffered from the front of
 		// the payload.
-		b = b[nbw:]
+		p = p[n:]
 
-		// Get the previous signal. This is used to guarantee ordered
-		// Writes by blocking this Write op until the previous Write op
-		// has completed.
-		sigPrev := c.buf.sigPrev
-
-		// Create a new signal to track this buffered Write. The
-		// channel is buffered for two signals:
-		//
-		//    * Signal 1 - The buffer has been read
-		//    * Signal 2 - The buffered data has been written to the pipe
-		sigDone := make(chan struct{}, 1)
-
-		// Assign the new signal to the connection's previous signal field.
-		c.buf.sigPrev = sigDone
-
-		// Start a goroutine to perform the write asynchronously.
-		go c.readBufferAndWritePipe(nbw, sigPrev, sigDone)
+		// Notify the read loop that the buffer has data.
+		c.buf.tx.wrRx <- struct{}{}
 	}
 
-	return nb, nil
+	return buffered, nil
 }
 
-// doesBufferHaveFreeSpace sets the cap and free values to a buffer's
-// current capacity and free space. free is set to -1 if the
-// buffer has no set capacity. A true value is returned if
-// free < 0 or free > 0.
-func (c *Conn) doesBufferHaveFreeSpace(cap, free *int) bool {
-	if *cap = c.buf.data.Cap(); *cap == 0 {
-		*free = -1
-	} else {
-		*free = *cap - c.buf.data.Len()
-	}
-	return *free < 0 || *free > 0
-}
+func (c *Conn) readBufferWriteToPipeLoop() {
+	for {
+		// Block until announcing the buffer has free space or until
+		// the remote side of the connection has been closed.
+		select {
+		case c.buf.tx.rdRx <- struct{}{}:
+		case <-c.remoteDone:
+			go func() {
+				c.buf.errs <- &net.OpError{
+					Op:     "write",
+					Addr:   c.raddr,
+					Source: c.laddr,
+					Net:    c.raddr.network,
+					Err:    io.ErrClosedPipe,
+				}
+			}()
+			return
+		}
 
-func (c *Conn) writeBuffer(b []byte) (int, error) {
-	// The wait group tracks the number of buffer attempts, not the
-	// actual Write.
-	c.buf.wait.Add(1)
+		// Block until there is data in the buffer or until the
+		// remote side of the connection has been closed.
+		select {
+		case <-c.buf.tx.wrRx:
+		case <-c.remoteDone:
+			go func() {
+				c.buf.errs <- &net.OpError{
+					Op:     "write",
+					Addr:   c.raddr,
+					Source: c.laddr,
+					Net:    c.raddr.network,
+					Err:    io.ErrClosedPipe,
+				}
+			}()
+			return
+		}
 
-	// Wait until there is free space in the buffer to proceed.
-	var cap int
-	var free int
-	c.buf.cond.L.Lock()
-	for !c.doesBufferHaveFreeSpace(&cap, &free) {
-		c.buf.cond.Wait()
-	}
-	defer c.buf.cond.L.Unlock()
+		// Skip the write if there are no unread bytes in the buffer.
+		if c.buf.tx.data.Len() == 0 {
+			continue
+		}
 
-	// If the amount of free space is greater than the payload the
-	// entire payload can be buffered at once. Otherwise buffer
-	// only the number of bytes equal to the free space.
-	if free < 0 || free > len(b) {
-		free = len(b)
-	}
-
-	// Write as much data as there is free space.
-	return c.buf.data.Write(b[:free])
-}
-
-func (c *Conn) readBuffer(nbw int) ([]byte, error) {
-	c.buf.cond.L.Lock()
-	defer c.buf.cond.L.Unlock()
-
-	// Indicate the buffer has been read.
-	defer c.buf.wait.Done()
-
-	// Wake up a writeBuffer call that is waiting on free space.
-	defer c.buf.cond.Signal()
-
-	b := make([]byte, nbw)
-	if nbr, err := c.buf.data.Read(b); err != nil {
-		return nil, err
-	} else if nbr < nbw {
-		return nil, fmt.Errorf("trunc read: exp=%d act=%d", nbw, nbr)
-	}
-
-	return b, nil
-}
-
-func (c *Conn) readBufferAndWritePipe(nbw int, sigPrev, sigDone chan struct{}) {
-	// Wait on the previous task's first signal, indicating
-	// the previous task has read the buffer.
-	<-sigPrev
-
-	// Read the buffered data.
-	b, err := c.readBuffer(nbw)
-
-	// Signal that this goroutine has read the buffer.
-	sigDone <- struct{}{}
-
-	// Ensure that second signal is sent when the buffered
-	// data has been written to the underlying pipe.
-	defer close(sigDone)
-
-	if err != nil {
-		go func() { c.buf.errs <- err }()
-		return
-	}
-
-	// Do not proceed until the previous task has written its data to
-	// the underlying pipe. If the remote side of the connection has
-	// been closed then return without writing the data since there will
-	// be no point in doing so.
-	select {
-	case <-sigPrev:
-	case <-c.remoteDone:
-		return
-	}
-
-	// Write the temporary buffer into the underlying connection.
-	nw, err := c.writeSync(b)
-	if err != nil {
-		go func() { c.buf.errs <- err }()
-		return
-	}
-
-	if !c.isRemote {
-		log.Printf("%05d", nw)
-	}
-
-	if nw != nbw {
-		err := fmt.Errorf("trunc write: exp=%d act=%d", nbw, nw)
-		go func() { c.buf.errs <- err }()
+		// Drain the buffer into the underlying pipe. The buffer's
+		// WriteTo function is used because it writes the unread
+		// bytes directly to the destination (https://goo.gl/ebKihy).
+		// This ensures there is never more data held in memory than
+		// the specified buffer maximum, the remote side of the
+		// connection notwithstanding.
+		if _, err := c.buf.tx.data.WriteTo(&c.pipe); err != nil {
+			go func() {
+				c.buf.errs <- &net.OpError{
+					Op:     "write",
+					Addr:   c.raddr,
+					Source: c.laddr,
+					Net:    c.raddr.network,
+					Err:    err,
+				}
+			}()
+		}
 	}
 }

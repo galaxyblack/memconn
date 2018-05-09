@@ -2,9 +2,11 @@ package memconn_test
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net"
 	"os"
@@ -14,6 +16,30 @@ import (
 
 	"github.com/akutz/memconn"
 )
+
+var args struct {
+	clients int
+}
+
+func TestMain(m *testing.M) {
+	// Seed the random package so the values returned by rand.Int63n
+	// are not predetermined.
+	rand.Seed(time.Now().UnixNano())
+
+	flag.IntVar(
+		&args.clients,
+		"clients", 1,
+		"The number of clients accessing a server during a test execution.")
+
+	flag.Parse()
+
+	// Discard all log statements unless -test.v is present.
+	if !testing.Verbose() {
+		log.SetOutput(ioutil.Discard)
+	}
+
+	os.Exit(m.Run())
+}
 
 // TestMemuNoDeadline validates that the memu connection properly implements
 // the net.Conn interface's deadline semantics.
@@ -201,8 +227,8 @@ func testNetConnParallel(
 
 	defer lis.Close()
 	network, addr := lis.Addr().Network(), lis.Addr().String()
-	t.Run("Parallel", func(t *testing.T) {
-		for i := 0; i < parallelTests; i++ {
+	t.Run("Client", func(t *testing.T) {
+		for i := 0; i < args.clients; i++ {
 			t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 				t.Parallel()
 				writeAndReadTestData(t, network, addr, dial)
